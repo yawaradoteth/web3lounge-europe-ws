@@ -1,0 +1,17 @@
+{
+  "name": "web3lounge-europe-ws",
+  "version": "1.0.0",
+  "private": true,
+  "description": "WebSocket server for Web3 Lounge (Europe / Render)",
+  "main": "server.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
