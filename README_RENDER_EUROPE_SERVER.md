@@ -26,7 +26,18 @@ Authoritative live-gameplay backend for the Europe region of web3lounge.
     `playerId`/`room`/`ts` so a hacked client can't replay drop lists.
   - Item rolls move fully server-side in Phase 5/6 once `items.ts` /
     `monsters.ts` are ported (or the service-role key is wired in).
-- Phase 4 — PvP arena combat: TODO.
+- **Phase 4 — Server-validated PvP intents & kill confirms** ✅
+  - `pvp_attack_intent`, `player_hit`, `pvp_kill`, and `vitals` all flow
+    through the server, which re-stamps `playerId`/`room`/`ts` from the
+    authenticated socket so a hacked client can't forge attacks, hits,
+    kills, or HP bars on behalf of another player.
+  - Range gate: PvP intent center must be within ~8 tiles of the attacker's
+    last known position; AOE radius capped at 6 tiles.
+  - Dedupe rings: `intentId` (1024), `player_hit` synthetic id (512),
+    `pvp_kill` (256). Replays are silently dropped.
+  - HP application still lives on the victim client (matches Asia model);
+    Phase 5/6 will move HP/EXP/inventory writes server-side once the
+    service-role key is wired in.
 - Phase 5 — Quest progress writes (needs `SUPABASE_SERVICE_ROLE_KEY`): TODO.
 - Phase 6 — Inventory/EXP/gold writes (needs service-role key): TODO.
 

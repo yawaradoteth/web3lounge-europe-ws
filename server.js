@@ -19,25 +19,25 @@
 //   - Frontier / PvP arena will be added in Phase 1B.
 //   - No loot / EXP / quest credit yet (those need service-role DB writes).
 
-const express = require('express');
-const http = require('http');
-const { WebSocketServer } = require('ws');
-const { TILE_SIZE, MONSTER_DEFS, WILDWOOD_SPAWNS, FRONTIER_SPAWNS, getEffectiveDef } = require('./monsterDefs');
-const { getCooldownMs, graceFor } = require('./skillDefs');
+const express = require("express");
+const http = require("http");
+const { WebSocketServer } = require("ws");
+const { TILE_SIZE, MONSTER_DEFS, WILDWOOD_SPAWNS, FRONTIER_SPAWNS, getEffectiveDef } = require("./monsterDefs");
+const { getCooldownMs, graceFor } = require("./skillDefs");
 
 const PORT = process.env.PORT || 8080;
 
 // ---------------------------------------------------------------------------
 // Tunables (mirror client constants where relevant)
 // ---------------------------------------------------------------------------
-const TICK_HZ = 20;                 // monster AI tick rate
-const SNAPSHOT_HZ = 12;             // broadcast cadence (~80ms, matches client)
+const TICK_HZ = 20; // monster AI tick rate
+const SNAPSHOT_HZ = 12; // broadcast cadence (~80ms, matches client)
 const RESPAWN_MS = 15_000;
 const ATTACK_ANIM_MS = 280;
-const AGGRO_LOSE_MULT = 1.5;        // give up chase outside aggro * this
-const HOME_TETHER_TILES = 6;        // monster won't wander further than this from spawn
+const AGGRO_LOSE_MULT = 1.5; // give up chase outside aggro * this
+const HOME_TETHER_TILES = 6; // monster won't wander further than this from spawn
 const INTENT_DEDUP_SIZE = 1024;
-const PLAYER_STALE_MS = 30_000;     // drop player if no message for 30s
+const PLAYER_STALE_MS = 30_000; // drop player if no message for 30s
 const MAX_DAMAGE_PER_INTENT = 9999; // hard cap to mitigate trivial cheating
 
 // ---------------------------------------------------------------------------
@@ -45,7 +45,7 @@ const MAX_DAMAGE_PER_INTENT = 9999; // hard cap to mitigate trivial cheating
 // ---------------------------------------------------------------------------
 const app = express();
 
-app.get('/health', (_req, res) => {
+app.get("/health", (_req, res) => {
   let totalMonsters = 0;
   let totalPlayers = 0;
   for (const r of rooms.values()) {
@@ -54,17 +54,17 @@ app.get('/health', (_req, res) => {
   }
   res.json({
     ok: true,
-    region: 'europe',
-    service: 'websocket',
-    phase: '2',
+    region: "europe",
+    service: "websocket",
+    phase: "4",
     rooms: rooms.size,
     players: totalPlayers,
     monsters: totalMonsters,
   });
 });
 
-app.get('/', (_req, res) => {
-  res.type('text/plain').send('web3lounge europe websocket server. Use /health or connect via WSS.');
+app.get("/", (_req, res) => {
+  res.type("text/plain").send("web3lounge europe websocket server. Use /health or connect via WSS.");
 });
 
 const server = http.createServer(app);
@@ -123,6 +123,12 @@ function getRoom(roomKey) {
       monsters: null,
       intentSeen: new Set(),
       intentOrder: [],
+      pvpIntentSeen: new Set(),
+      pvpIntentOrder: [],
+      pvpKillSeen: new Set(),
+      pvpKillOrder: [],
+      playerHitSeen: new Set(),
+      playerHitOrder: [],
       lastSnapshotAt: 0,
     };
     rooms.set(roomKey, r);
@@ -133,21 +139,30 @@ function getRoom(roomKey) {
 function spawnEntry(uid, defId, tileX, tileY, rank) {
   const baseDef = MONSTER_DEFS[defId];
   if (!baseDef) return null;
-  const eff = getEffectiveDef(defId, rank || 'normal');
+  const eff = getEffectiveDef(defId, rank || "normal");
   const x = tileX * TILE_SIZE + TILE_SIZE / 2;
   const y = tileY * TILE_SIZE + TILE_SIZE / 2;
   return {
     uid,
     defId,
-    rank: rank || (baseDef.rank ?? 'normal'),
-    x, y, spawnX: x, spawnY: y,
-    hp: eff.maxHp, maxHp: eff.maxHp,
-    state: 'idle', facing: 'left',
-    attackAnimEnd: 0, attackCdEnd: 0,
-    deathAt: 0, respawnAt: 0,
-    lastTargetX: x, lastTargetY: y,
+    rank: rank || (baseDef.rank ?? "normal"),
+    x,
+    y,
+    spawnX: x,
+    spawnY: y,
+    hp: eff.maxHp,
+    maxHp: eff.maxHp,
+    state: "idle",
+    facing: "left",
+    attackAnimEnd: 0,
+    attackCdEnd: 0,
+    deathAt: 0,
+    respawnAt: 0,
+    lastTargetX: x,
+    lastTargetY: y,
     nextWanderAt: Date.now() + 1000 + Math.random() * 2000,
-    wanderVx: 0, wanderVy: 0,
+    wanderVx: 0,
+    wanderVy: 0,
     aggroId: null,
   };
 }
@@ -156,19 +171,19 @@ function spawnEntry(uid, defId, tileX, tileY, rank) {
 function ensureMonsters(roomKey) {
   const r = getRoom(roomKey);
   if (r.monsters) return r;
-  if (roomKey === 'europe:wildwood') {
+  if (roomKey === "europe:wildwood") {
     r.monsters = new Map();
     WILDWOOD_SPAWNS.forEach((s, i) => {
       const uid = `wildwood:${i}`;
-      const m = spawnEntry(uid, s.defId, s.tileX, s.tileY, s.elite ? 'elite' : null);
+      const m = spawnEntry(uid, s.defId, s.tileX, s.tileY, s.elite ? "elite" : null);
       if (m) r.monsters.set(uid, m);
     });
     console.log(`[ws] initialized ${r.monsters.size} monsters for ${roomKey}`);
-  } else if (roomKey === 'europe:frontier') {
+  } else if (roomKey === "europe:frontier") {
     r.monsters = new Map();
     FRONTIER_SPAWNS.forEach((s, i) => {
       const uid = `frontier:${i}`;
-      const m = spawnEntry(uid, s.defId, s.tileX, s.tileY, s.elite ? 'elite' : null);
+      const m = spawnEntry(uid, s.defId, s.tileX, s.tileY, s.elite ? "elite" : null);
       if (m) r.monsters.set(uid, m);
     });
     console.log(`[ws] initialized ${r.monsters.size} monsters for ${roomKey}`);
@@ -198,11 +213,13 @@ function sendTo(ws, payload) {
 
 function buildMonsterRow(m) {
   return {
-    room_key: '',  // filled by broadcaster
+    room_key: "", // filled by broadcaster
     monster_key: m.uid,
     def_id: m.defId,
-    x: m.x, y: m.y,
-    spawn_x: m.spawnX, spawn_y: m.spawnY,
+    x: m.x,
+    y: m.y,
+    spawn_x: m.spawnX,
+    spawn_y: m.spawnY,
     hp: m.hp,
     state: m.state,
     facing: m.facing,
@@ -228,17 +245,19 @@ function broadcastMonsterSnapshot(roomKey) {
   // Wire format mirrors client's MonsterSnapshotEvent.
   const evt = {
     room: roomKey,
-    hostId: 'server:europe',
+    hostId: "server:europe",
     monsters: rows,
     ts: Date.now(),
   };
-  broadcastToRoom(roomKey, { type: 'monster_snapshot', payload: evt });
+  broadcastToRoom(roomKey, { type: "monster_snapshot", payload: evt });
 }
 
 // ---------------------------------------------------------------------------
 // Monster AI (simple melee chase + wander)
 // ---------------------------------------------------------------------------
-function effDef(m) { return getEffectiveDef(m.defId, m.rank || 'normal'); }
+function effDef(m) {
+  return getEffectiveDef(m.defId, m.rank || "normal");
+}
 
 function nearestAlivePlayer(room, m) {
   const def = effDef(m);
@@ -250,7 +269,10 @@ function nearestAlivePlayer(room, m) {
     const dx = p.x - m.x;
     const dy = p.y - m.y;
     const d2 = dx * dx + dy * dy;
-    if (d2 < bestDist) { best = p; bestDist = d2; }
+    if (d2 < bestDist) {
+      best = p;
+      bestDist = d2;
+    }
   }
   if (!best) return null;
   const limit = m.aggroId ? losePx : aggroPx;
@@ -259,8 +281,8 @@ function nearestAlivePlayer(room, m) {
 }
 
 function attackKindToWire(kind) {
-  if (kind === 'fireball' || kind === 'arrow' || kind === 'magic_orb') return kind;
-  return 'melee';
+  if (kind === "fireball" || kind === "arrow" || kind === "magic_orb") return kind;
+  return "melee";
 }
 
 function tickRoom(roomKey, dtMs) {
@@ -271,31 +293,43 @@ function tickRoom(roomKey, dtMs) {
 
   for (const m of r.monsters.values()) {
     // ---------- Death / respawn ----------
-    if (m.state === 'dead') {
+    if (m.state === "dead") {
       if (m.respawnAt > 0 && now >= m.respawnAt) {
-        m.x = m.spawnX; m.y = m.spawnY;
+        m.x = m.spawnX;
+        m.y = m.spawnY;
         const def = effDef(m);
-        m.hp = def.maxHp; m.maxHp = def.maxHp;
-        m.state = 'idle';
-        m.deathAt = 0; m.respawnAt = 0;
-        m.attackAnimEnd = 0; m.attackCdEnd = 0;
+        m.hp = def.maxHp;
+        m.maxHp = def.maxHp;
+        m.state = "idle";
+        m.deathAt = 0;
+        m.respawnAt = 0;
+        m.attackAnimEnd = 0;
+        m.attackCdEnd = 0;
         m.aggroId = null;
         m.nextWanderAt = now + 1000 + Math.random() * 2000;
       }
       continue;
     }
-    if (m.state === 'dying') {
+    if (m.state === "dying") {
       if (now - m.deathAt > 500) {
-        m.state = 'dead';
+        m.state = "dead";
         m.respawnAt = now + RESPAWN_MS;
       }
       continue;
     }
 
     const def = effDef(m);
-    const role = def.role || 'melee';
-    const isRanged = role === 'ranged' || role === 'magic' || def.attackKind === 'fireball' || def.attackKind === 'arrow' || def.attackKind === 'magic_orb';
-    const projectileKind = (def.attackKind === 'fireball' || def.attackKind === 'arrow' || def.attackKind === 'magic_orb') ? def.attackKind : null;
+    const role = def.role || "melee";
+    const isRanged =
+      role === "ranged" ||
+      role === "magic" ||
+      def.attackKind === "fireball" ||
+      def.attackKind === "arrow" ||
+      def.attackKind === "magic_orb";
+    const projectileKind =
+      def.attackKind === "fireball" || def.attackKind === "arrow" || def.attackKind === "magic_orb"
+        ? def.attackKind
+        : null;
 
     // ---------- Aggro ----------
     let target = null;
@@ -314,7 +348,7 @@ function tickRoom(roomKey, dtMs) {
       const dist = Math.hypot(dx, dy) || 1;
       m.lastTargetX = target.x;
       m.lastTargetY = target.y;
-      m.facing = Math.abs(dx) > Math.abs(dy) ? (dx < 0 ? 'left' : 'right') : (dy < 0 ? 'up' : 'down');
+      m.facing = Math.abs(dx) > Math.abs(dy) ? (dx < 0 ? "left" : "right") : dy < 0 ? "up" : "down";
 
       const fromHome = Math.hypot(m.x - m.spawnX, m.y - m.spawnY);
       const speed = def.speed * (dtMs / 16.67);
@@ -325,29 +359,33 @@ function tickRoom(roomKey, dtMs) {
         const pref = def.preferredRangePx || Math.max(80, def.attackRangePx * 0.8);
         if (fromHome >= homeRange) {
           // recover home
-          const hx = m.spawnX - m.x, hy = m.spawnY - m.y;
+          const hx = m.spawnX - m.x,
+            hy = m.spawnY - m.y;
           const hd = Math.hypot(hx, hy) || 1;
-          m.x += (hx / hd) * speed; m.y += (hy / hd) * speed;
-          m.aggroId = null; m.state = 'chase';
+          m.x += (hx / hd) * speed;
+          m.y += (hy / hd) * speed;
+          m.aggroId = null;
+          m.state = "chase";
         } else if (dist < pref * 0.7) {
           // back away
           m.x -= (dx / dist) * speed * 0.7;
           m.y -= (dy / dist) * speed * 0.7;
-          m.state = 'chase';
+          m.state = "chase";
         } else if (dist > def.attackRangePx) {
-          m.x += (dx / dist) * speed; m.y += (dy / dist) * speed;
-          m.state = 'chase';
+          m.x += (dx / dist) * speed;
+          m.y += (dy / dist) * speed;
+          m.state = "chase";
         } else {
-          m.state = 'attack';
+          m.state = "attack";
         }
         if (dist <= def.attackRangePx && now >= m.attackCdEnd) {
           m.attackAnimEnd = now + ATTACK_ANIM_MS;
           m.attackCdEnd = now + def.attackCdMs;
           // Broadcast projectile spawn so clients render it.
           broadcastToRoom(roomKey, {
-            type: 'monster_attack',
+            type: "monster_attack",
             payload: {
-              playerId: 'server:europe',
+              playerId: "server:europe",
               room: roomKey,
               monsterUid: m.uid,
               kind: projectileKind,
@@ -356,8 +394,8 @@ function tickRoom(roomKey, dtMs) {
               ts: now,
             },
           });
-        } else if (now >= m.attackAnimEnd && m.state === 'attack' && dist > def.attackRangePx) {
-          m.state = 'idle';
+        } else if (now >= m.attackAnimEnd && m.state === "attack" && dist > def.attackRangePx) {
+          m.state = "idle";
         }
         continue;
       }
@@ -368,33 +406,34 @@ function tickRoom(roomKey, dtMs) {
           m.x += (dx / dist) * speed;
           m.y += (dy / dist) * speed;
         } else {
-          const hx = m.spawnX - m.x, hy = m.spawnY - m.y;
+          const hx = m.spawnX - m.x,
+            hy = m.spawnY - m.y;
           const hd = Math.hypot(hx, hy) || 1;
           m.x += (hx / hd) * speed;
           m.y += (hy / hd) * speed;
           m.aggroId = null;
         }
-        m.state = 'chase';
+        m.state = "chase";
       } else {
-        m.state = 'attack';
+        m.state = "attack";
         if (now >= m.attackCdEnd) {
           m.attackAnimEnd = now + ATTACK_ANIM_MS;
           m.attackCdEnd = now + def.attackCdMs;
           // Notify clients of melee swing (animation only; client handles self-damage).
           broadcastToRoom(roomKey, {
-            type: 'monster_attack',
+            type: "monster_attack",
             payload: {
-              playerId: 'server:europe',
+              playerId: "server:europe",
               room: roomKey,
               monsterUid: m.uid,
-              kind: 'melee',
+              kind: "melee",
               tx: target.x,
               ty: target.y,
               ts: now,
             },
           });
         } else if (now >= m.attackAnimEnd) {
-          m.state = 'idle';
+          m.state = "idle";
         }
       }
       continue;
@@ -402,29 +441,37 @@ function tickRoom(roomKey, dtMs) {
 
     // Stationary attacker (e.g. piranha)
     if (target && def.stationary) {
-      const dx = target.x - m.x, dy = target.y - m.y;
+      const dx = target.x - m.x,
+        dy = target.y - m.y;
       const dist = Math.hypot(dx, dy) || 1;
-      m.facing = Math.abs(dx) > Math.abs(dy) ? (dx < 0 ? 'left' : 'right') : (dy < 0 ? 'up' : 'down');
+      m.facing = Math.abs(dx) > Math.abs(dy) ? (dx < 0 ? "left" : "right") : dy < 0 ? "up" : "down";
       if (dist <= def.attackRangePx && now >= m.attackCdEnd) {
-        m.state = 'attack';
+        m.state = "attack";
         m.attackAnimEnd = now + ATTACK_ANIM_MS;
         m.attackCdEnd = now + def.attackCdMs;
         broadcastToRoom(roomKey, {
-          type: 'monster_attack',
+          type: "monster_attack",
           payload: {
-            playerId: 'server:europe', room: roomKey, monsterUid: m.uid,
-            kind: projectileKind || 'melee',
-            tx: target.x, ty: target.y, ts: now,
+            playerId: "server:europe",
+            room: roomKey,
+            monsterUid: m.uid,
+            kind: projectileKind || "melee",
+            tx: target.x,
+            ty: target.y,
+            ts: now,
           },
         });
       } else if (now >= m.attackAnimEnd) {
-        m.state = 'idle';
+        m.state = "idle";
       }
       continue;
     }
 
     // ---------- Wander / idle ----------
-    if (def.stationary) { m.state = 'idle'; continue; }
+    if (def.stationary) {
+      m.state = "idle";
+      continue;
+    }
     if (now >= m.nextWanderAt) {
       m.nextWanderAt = now + 2000 + Math.random() * 3000;
       const angle = Math.random() * Math.PI * 2;
@@ -437,15 +484,22 @@ function tickRoom(roomKey, dtMs) {
       const nx = m.x + m.wanderVx * speed;
       const ny = m.y + m.wanderVy * speed;
       if (Math.hypot(nx - m.spawnX, ny - m.spawnY) < homeRange * 0.5) {
-        m.x = nx; m.y = ny;
-        m.facing = Math.abs(m.wanderVx) > Math.abs(m.wanderVy)
-          ? (m.wanderVx < 0 ? 'left' : 'right')
-          : (m.wanderVy < 0 ? 'up' : 'down');
+        m.x = nx;
+        m.y = ny;
+        m.facing =
+          Math.abs(m.wanderVx) > Math.abs(m.wanderVy)
+            ? m.wanderVx < 0
+              ? "left"
+              : "right"
+            : m.wanderVy < 0
+              ? "up"
+              : "down";
       } else {
-        m.wanderVx = -m.wanderVx; m.wanderVy = -m.wanderVy;
+        m.wanderVx = -m.wanderVx;
+        m.wanderVy = -m.wanderVy;
       }
     }
-    m.state = 'idle';
+    m.state = "idle";
   }
 }
 
@@ -460,6 +514,19 @@ function rememberIntent(room, intentId) {
   if (room.intentOrder.length > INTENT_DEDUP_SIZE) {
     const old = room.intentOrder.shift();
     room.intentSeen.delete(old);
+  }
+  return false;
+}
+
+/** Generic bounded-set dedup. Returns true if the id was already seen. */
+function rememberId(seenSet, orderArr, id, max) {
+  if (!id) return false;
+  if (seenSet.has(id)) return true;
+  seenSet.add(id);
+  orderArr.push(id);
+  if (orderArr.length > max) {
+    const drop = orderArr.shift();
+    if (drop) seenSet.delete(drop);
   }
   return false;
 }
@@ -482,7 +549,8 @@ function resolveAttackIntent(roomKey, evt, attackerWs) {
   const attacker = r.players.get(attackerId);
   if (!attacker) return; // ghost intent — ignore.
 
-  const ax = Number(evt.x), ay = Number(evt.y);
+  const ax = Number(evt.x),
+    ay = Number(evt.y);
   const ar = Math.max(8, Number(evt.r) || 24);
   if (!isFinite(ax) || !isFinite(ay)) return;
   // Guard against absurd radius — cap at 1.5 tiles.
@@ -492,14 +560,16 @@ function resolveAttackIntent(roomKey, evt, attackerWs) {
   const critChance = Math.max(0, Math.min(1, Number(evt.attackerCrit) || 0));
 
   for (const m of r.monsters.values()) {
-    if (m.state === 'dead' || m.state === 'dying') continue;
+    if (m.state === "dead" || m.state === "dying") continue;
     if (m.hp <= 0) continue;
-    const dx = m.x - ax, dy = m.y - ay;
+    const dx = m.x - ax,
+      dy = m.y - ay;
     if (dx * dx + dy * dy > r2 * r2) continue;
 
     // Sanity range gate: attacker must be near the area they're claiming to hit.
-    const adx = attacker.x - ax, ady = attacker.y - ay;
-    if (adx * adx + ady * ady > (TILE_SIZE * 8) * (TILE_SIZE * 8)) continue;
+    const adx = attacker.x - ax,
+      ady = attacker.y - ay;
+    if (adx * adx + ady * ady > TILE_SIZE * 8 * (TILE_SIZE * 8)) continue;
 
     // Compute damage.
     let dmg;
@@ -522,7 +592,7 @@ function resolveAttackIntent(roomKey, evt, attackerWs) {
     let died = false;
     if (m.hp <= 0) {
       m.hp = 0;
-      m.state = 'dying';
+      m.state = "dying";
       m.deathAt = Date.now();
       m.aggroId = null;
       died = true;
@@ -530,18 +600,19 @@ function resolveAttackIntent(roomKey, evt, attackerWs) {
 
     // Echo a monster_hit event so attacker sees floating damage immediately.
     const hitEvt = {
-      playerId: 'server:europe',
+      playerId: "server:europe",
       room: roomKey,
       monsterUid: m.uid,
       dmg,
       crit,
-      x: m.x, y: m.y,
+      x: m.x,
+      y: m.y,
       attackerId,
       hpAfter: m.hp,
       died,
       ts: Date.now(),
     };
-    broadcastToRoom(roomKey, { type: 'monster_hit', payload: hitEvt });
+    broadcastToRoom(roomKey, { type: "monster_hit", payload: hitEvt });
   }
 }
 
@@ -555,26 +626,30 @@ function leaveCurrentRoom(ws) {
   if (r) {
     r.players.delete(meta.userId);
   }
-  broadcastToRoom(meta.roomKey, { type: 'player_left', payload: { playerId: meta.characterId } }, ws);
+  broadcastToRoom(meta.roomKey, { type: "player_left", payload: { playerId: meta.characterId } }, ws);
   sockets.delete(ws);
 }
 
-wss.on('connection', (ws) => {
-  console.log('[ws] client connected');
+wss.on("connection", (ws) => {
+  console.log("[ws] client connected");
 
-  ws.on('message', (raw) => {
+  ws.on("message", (raw) => {
     let msg;
-    try { msg = JSON.parse(raw.toString()); } catch { return; }
-    if (!msg || typeof msg !== 'object') return;
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch {
+      return;
+    }
+    if (!msg || typeof msg !== "object") return;
 
     switch (msg.type) {
-      case 'ping': {
-        sendTo(ws, { type: 'pong', clientTime: msg.clientTime, serverTime: Date.now() });
+      case "ping": {
+        sendTo(ws, { type: "pong", clientTime: msg.clientTime, serverTime: Date.now() });
         return;
       }
 
-      case 'join': {
-        const mapId = msg.mapId || 'town';
+      case "join": {
+        const mapId = msg.mapId || "town";
         const characterId = msg.characterId || msg.playerId;
         if (!characterId) return;
         leaveCurrentRoom(ws);
@@ -586,20 +661,20 @@ wss.on('connection', (ws) => {
           name: msg.name,
           x: Number(msg.x) || 0,
           y: Number(msg.y) || 0,
-          direction: msg.direction || 'down',
+          direction: msg.direction || "down",
           mapId,
           class: msg.class,
           level: msg.level,
-          castCdEnds: {},      // skillId -> ms-since-epoch when cast becomes legal
+          castCdEnds: {}, // skillId -> ms-since-epoch when cast becomes legal
           castSeen: new Set(), // dedupe set for castIds (size-bounded)
           castOrder: [],
         };
         room.players.set(characterId, player);
         sockets.set(ws, { roomKey, userId: characterId, characterId });
 
-        const existing = Array.from(room.players.values()).filter(p => p.characterId !== characterId);
-        sendTo(ws, { type: 'existing_players', players: existing });
-        broadcastToRoom(roomKey, { type: 'player_joined', player }, ws);
+        const existing = Array.from(room.players.values()).filter((p) => p.characterId !== characterId);
+        sendTo(ws, { type: "existing_players", players: existing });
+        broadcastToRoom(roomKey, { type: "player_joined", player }, ws);
 
         // Send an immediate monster snapshot so the joiner sees current state.
         if (room.monsters && room.monsters.size > 0) {
@@ -610,35 +685,39 @@ wss.on('connection', (ws) => {
             rows.push(row);
           }
           sendTo(ws, {
-            type: 'monster_snapshot',
-            payload: { room: roomKey, hostId: 'server:europe', monsters: rows, ts: Date.now() },
+            type: "monster_snapshot",
+            payload: { room: roomKey, hostId: "server:europe", monsters: rows, ts: Date.now() },
           });
         }
         return;
       }
 
-      case 'move': {
+      case "move": {
         const meta = sockets.get(ws);
         if (!meta) return;
         const characterId = msg.characterId || meta.characterId;
-        const newMapId = msg.mapId || 'town';
+        const newMapId = msg.mapId || "town";
         const newRoomKey = `europe:${newMapId}`;
         if (newRoomKey !== meta.roomKey) {
           // Map change — leave old, join new.
           leaveCurrentRoom(ws);
           const room = ensureMonsters(newRoomKey);
           const player = {
-            characterId, userId: characterId,
-            x: Number(msg.x) || 0, y: Number(msg.y) || 0,
-            direction: msg.direction || 'down',
+            characterId,
+            userId: characterId,
+            x: Number(msg.x) || 0,
+            y: Number(msg.y) || 0,
+            direction: msg.direction || "down",
             mapId: newMapId,
-            castCdEnds: {}, castSeen: new Set(), castOrder: [],
+            castCdEnds: {},
+            castSeen: new Set(),
+            castOrder: [],
           };
           room.players.set(characterId, player);
           sockets.set(ws, { roomKey: newRoomKey, userId: characterId, characterId });
-          const existing = Array.from(room.players.values()).filter(p => p.characterId !== characterId);
-          sendTo(ws, { type: 'existing_players', players: existing });
-          broadcastToRoom(newRoomKey, { type: 'player_joined', player }, ws);
+          const existing = Array.from(room.players.values()).filter((p) => p.characterId !== characterId);
+          sendTo(ws, { type: "existing_players", players: existing });
+          broadcastToRoom(newRoomKey, { type: "player_joined", player }, ws);
           if (room.monsters && room.monsters.size > 0) {
             const rows = [];
             for (const m of room.monsters.values()) {
@@ -647,8 +726,8 @@ wss.on('connection', (ws) => {
               rows.push(row);
             }
             sendTo(ws, {
-              type: 'monster_snapshot',
-              payload: { room: newRoomKey, hostId: 'server:europe', monsters: rows, ts: Date.now() },
+              type: "monster_snapshot",
+              payload: { room: newRoomKey, hostId: "server:europe", monsters: rows, ts: Date.now() },
             });
           }
           return;
@@ -661,32 +740,42 @@ wss.on('connection', (ws) => {
           p.y = Number(msg.y) || 0;
           p.direction = msg.direction || p.direction;
         }
-        broadcastToRoom(meta.roomKey, {
-          type: 'player_moved',
-          payload: { playerId: characterId, x: msg.x, y: msg.y, dir: msg.direction, room: newMapId === 'town' ? 'world' : newMapId },
-        }, ws);
+        broadcastToRoom(
+          meta.roomKey,
+          {
+            type: "player_moved",
+            payload: {
+              playerId: characterId,
+              x: msg.x,
+              y: msg.y,
+              dir: msg.direction,
+              room: newMapId === "town" ? "world" : newMapId,
+            },
+          },
+          ws,
+        );
         return;
       }
 
-      case 'attack_intent': {
+      case "attack_intent": {
         const meta = sockets.get(ws);
         if (!meta) return;
         // Trust the message's room for this event since the client sends a
         // namespaced room (e.g. 'europe:wildwood'); fall back to socket room.
         const targetRoom = (msg.payload && msg.payload.room) || meta.roomKey;
-        if (typeof targetRoom !== 'string' || !targetRoom.startsWith('europe:')) return;
+        if (typeof targetRoom !== "string" || !targetRoom.startsWith("europe:")) return;
         if (msg.payload) resolveAttackIntent(targetRoom, msg.payload, ws);
         return;
       }
 
-      case 'chat': {
+      case "chat": {
         const meta = sockets.get(ws);
         if (!meta) return;
-        broadcastToRoom(meta.roomKey, { type: 'chat', payload: msg.payload ?? msg }, null);
+        broadcastToRoom(meta.roomKey, { type: "chat", payload: msg.payload ?? msg }, null);
         return;
       }
 
-      case 'action': {
+      case "action": {
         // Phase 2: server-validated skill / basic-attack cast broadcast.
         // We re-stamp playerId from the socket, gate by per-player cooldown,
         // and dedupe by castId so a retransmit can't fire the visual twice.
@@ -697,8 +786,8 @@ wss.on('connection', (ws) => {
         const player = room.players.get(meta.userId);
         if (!player) return;
         const p = msg.payload || {};
-        const skillId = typeof p.skillId === 'string' ? p.skillId : null;
-        const kind = p.kind === 'skill' ? 'skill' : 'basic';
+        const skillId = typeof p.skillId === "string" ? p.skillId : null;
+        const kind = p.kind === "skill" ? "skill" : "basic";
         if (!skillId) return;
 
         const now = Date.now();
@@ -712,8 +801,7 @@ wss.on('connection', (ws) => {
           return;
         }
         // Dedupe by castId (when present). Bound the set so memory stays flat.
-        const castId = typeof p.castId === 'string' ? p.castId
-                       : `${meta.userId}:${skillId}:${p.ts || now}`;
+        const castId = typeof p.castId === "string" ? p.castId : `${meta.userId}:${skillId}:${p.ts || now}`;
         if (player.castSeen.has(castId)) return;
         player.castSeen.add(castId);
         player.castOrder.push(castId);
@@ -729,14 +817,99 @@ wss.on('connection', (ws) => {
         // Re-stamp playerId from the authenticated socket so a client can't
         // forge casts from another player.
         const safePayload = { ...p, playerId: meta.userId, room: meta.roomKey, ts: now };
-        broadcastToRoom(meta.roomKey, { type: 'action', payload: safePayload }, ws);
+        broadcastToRoom(meta.roomKey, { type: "action", payload: safePayload }, ws);
         return;
       }
 
+      case "pvp_attack_intent": {
+        // Phase 4: server-validated PvP attack intent.
+        // - Re-stamp playerId/room from authenticated socket (anti-spoof).
+        // - Dedupe by intentId so retransmits don't double-resolve.
+        // - Reject hits whose claimed origin is far from the attacker's last
+        //   known position (anti-teleport / range hack).
+        // - Cap radius so a hacked client can't claim a map-wide AOE.
+        // Damage application still happens on victim clients (they own their
+        // HP), matching the Asia model. Phase 5 will move HP server-side.
+        const meta = sockets.get(ws);
+        if (!meta) return;
+        const room = rooms.get(meta.roomKey);
+        if (!room) return;
+        const attacker = room.players.get(meta.userId);
+        if (!attacker) return;
+        const p = msg.payload || {};
+        const targetRoom = typeof p.room === "string" ? p.room : meta.roomKey;
+        if (targetRoom !== meta.roomKey) return;
+        const ax = Number(p.x), ay = Number(p.y);
+        const ar = Math.min(Math.max(8, Number(p.r) || 24), TILE_SIZE * 6);
+        if (!isFinite(ax) || !isFinite(ay)) return;
+        // Sanity: attacker must be near the claimed effect center.
+        const ddx = attacker.x - ax, ddy = attacker.y - ay;
+        if (ddx * ddx + ddy * ddy > (TILE_SIZE * 8) * (TILE_SIZE * 8)) return;
+        const intentId = typeof p.intentId === "string"
+          ? p.intentId
+          : `${meta.userId}:${p.skillId || "x"}:${p.ts || Date.now()}`;
+        if (rememberId(room.pvpIntentSeen, room.pvpIntentOrder, intentId, INTENT_DEDUP_SIZE)) return;
+        const safe = {
+          ...p,
+          playerId: meta.userId,
+          room: meta.roomKey,
+          x: ax, y: ay, r: ar,
+          intentId,
+          ts: Date.now(),
+        };
+        broadcastToRoom(meta.roomKey, { type: "pvp_attack_intent", payload: safe }, ws);
+        return;
+      }
+
+      case "player_hit": {
+        // Phase 4: relayed PvP/monster->player damage event from the resolving
+        // host (or victim). Re-stamp playerId, dedupe by a synthetic id so the
+        // same hit can't be amplified.
+        const meta = sockets.get(ws);
+        if (!meta) return;
+        const room = rooms.get(meta.roomKey);
+        if (!room) return;
+        const p = msg.payload || {};
+        const targetRoom = typeof p.room === "string" ? p.room : meta.roomKey;
+        if (targetRoom !== meta.roomKey) return;
+        const id = `${meta.userId}:${p.targetPlayerId || ""}:${p.monsterUid || ""}:${p.ts || Date.now()}:${p.dmg || 0}`;
+        if (rememberId(room.playerHitSeen, room.playerHitOrder, id, 512)) return;
+        const safe = { ...p, playerId: meta.userId, room: meta.roomKey, ts: Date.now() };
+        broadcastToRoom(meta.roomKey, { type: "player_hit", payload: safe }, ws);
+        return;
+      }
+
+      case "pvp_kill": {
+        // Victim broadcasts their own death + credited killer. Server re-stamps
+        // playerId so a third party can't forge kill credits, and dedupes per
+        // (victim, killer, ts) so a replayed kill can't pad a leaderboard.
+        const meta = sockets.get(ws);
+        if (!meta) return;
+        const room = rooms.get(meta.roomKey);
+        if (!room) return;
+        const p = msg.payload || {};
+        const killerId = typeof p.killerId === "string" ? p.killerId : "";
+        const ts = Number(p.ts) || Date.now();
+        const id = `${meta.userId}:${killerId}:${ts}`;
+        if (rememberId(room.pvpKillSeen, room.pvpKillOrder, id, 256)) return;
+        const safe = { playerId: meta.userId, room: meta.roomKey, killerId, ts: Date.now() };
+        broadcastToRoom(meta.roomKey, { type: "pvp_kill", payload: safe }, null);
+        return;
+      }
+
+      case "vitals": {
+        // Re-stamp playerId so a client can't broadcast vitals as someone else
+        // (which would let them fake another player's HP bar).
+        const meta = sockets.get(ws);
+        if (!meta) return;
+        const p = msg.payload || {};
+        const safe = { ...p, playerId: meta.userId, room: meta.roomKey };
+        broadcastToRoom(meta.roomKey, { type: "vitals", payload: safe }, ws);
+        return;
+      }
       default: {
-        // Generic broadcast pass-through (vitals, gather, action, etc.) so
-        // existing client features keep working while we expand authoritative
-        // coverage in later phases.
+        // Generic broadcast pass-through so existing client features keep
+        // working while we expand authoritative coverage in later phases.
         const meta = sockets.get(ws);
         if (!meta) return;
         broadcastToRoom(meta.roomKey, { type: msg.type, payload: msg.payload ?? msg }, ws);
@@ -744,12 +917,12 @@ wss.on('connection', (ws) => {
     }
   });
 
-  ws.on('close', () => {
-    console.log('[ws] client disconnected');
+  ws.on("close", () => {
+    console.log("[ws] client disconnected");
     leaveCurrentRoom(ws);
   });
 
-  ws.on('error', (err) => console.warn('[ws] socket error', err.message));
+  ws.on("error", (err) => console.warn("[ws] socket error", err.message));
 });
 
 // ---------------------------------------------------------------------------
