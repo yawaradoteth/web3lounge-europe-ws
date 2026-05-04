@@ -1,48 +1,43 @@
-# Web3 Lounge — Europe WebSocket on Render
+# Europe WebSocket Server — Render Deployment
 
-This service is a small Node.js HTTP + WebSocket server intended to run on [Render](https://render.com) in a **European region** (for example **Frankfurt**) so clients get lower latency to EU users.
+This is a **separate** service from the frontend. The frontend currently lives at
+`web3lounge.onrender.com`, so DO NOT overwrite it. Deploy this as a new Render
+Web Service.
 
-## What it exposes
+## Why a separate service?
 
-| Endpoint | Purpose |
-|----------|---------|
-| `GET /` or `GET /health` | JSON health check for Render and load balancers |
-| `WebSocket /ws` | Application WebSocket (JSON messages; supports `ping` / `pong` and generic echo) |
+A `GET https://web3lounge.onrender.com/health` returns the frontend HTML (200
+text/html), proving that domain is the static/SPA frontend. WebSocket upgrades
+also fail there. We need a dedicated Node service.
 
-## Environment variables
+## Deploy steps
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PORT` | `8080` | **Set by Render** — do not hardcode in production |
-| `WS_PING_INTERVAL_MS` | `30000` | Interval for WebSocket `ping` frames to keep connections alive behind proxies |
+1. Push `europe-ws-server/` to a Git repo (or use this monorepo with a Root
+   Directory of `europe-ws-server`).
+2. Render → **New +** → **Web Service**.
+3. Connect the repo.
+4. Settings:
+   - **Name**: `web3lounge-europe-ws` (final URL: `https://web3lounge-europe-ws.onrender.com`)
+   - **Region**: Frankfurt (EU Central)
+   - **Runtime**: Node
+   - **Root Directory**: `europe-ws-server` (if monorepo)
+   - **Build Command**: `npm install`
+   - **Start Command**: `npm start`
+   - **Instance Type**: Free is fine to start
+5. Create Web Service. Wait for "Live".
 
-## Local development
+## Verify
 
-```bash
-npm install
-npm run dev
+```
+curl https://web3lounge-europe-ws.onrender.com/health
+# -> {"ok":true,"region":"europe","service":"websocket"}
 ```
 
-- Health: `http://localhost:8080/health`
-- WebSocket URL: `ws://localhost:8080/ws`
-
-## Deploy on Render (Europe)
-
-1. Push this repo to GitHub (or connect your Git provider to Render).
-2. In the Render dashboard, create a **Web Service**.
-3. **Region:** choose **Frankfurt** (or another EU region Render offers).
-4. **Runtime:** Node.
-5. **Build command:** `npm install`
-6. **Start command:** `npm start`
-7. **Health check path:** `/health` (optional but recommended).
-
-After deploy, Render assigns a URL like `https://your-service.onrender.com`. Use WebSockets with the same host and TLS:
-
-- `wss://your-service.onrender.com/ws`
-
-Render’s free tier may spin services down after idle time; plan capacity and region according to your product needs.
+WebSocket: `wss://web3lounge-europe-ws.onrender.com`
 
 ## Notes
 
-- The server responds to `SIGTERM` / `SIGINT` so Render can stop it cleanly.
-- Client messages that are valid JSON with `{ "type": "ping", "t": ... }` receive `{ "type": "pong", "t": ... }`.
+- The server listens on `process.env.PORT` (Render injects this). Do not hardcode a port.
+- Free Render web services sleep after inactivity; first ping after sleep can
+  take 30–60s. Upgrade the plan if you need always-on.
+- The frontend at `web3lounge.onrender.com` is untouched.
