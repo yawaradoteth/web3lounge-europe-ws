@@ -5,11 +5,13 @@ Authoritative live-gameplay backend for the Europe region of web3lounge.
 ## Status
 
 - **Phase 1A — Server-authoritative monsters for Wildwood** ✅
-  - 17 fixed Wildwood spawns simulated server-side.
-  - Simple melee chase + wander AI (ranged/magic AI deferred to Phase 1B).
-  - `attack_intent` validated and resolved server-side with `intentId` dedup.
-  - `monster_snapshot` broadcast at ~12 Hz; immediate snapshot on join.
-- Phase 1B — Frontier monsters & ranged/magic AI: TODO.
+- **Phase 1B — Frontier monsters & ranged/magic AI** ✅
+  - All 60 monster defs ported (incl. role/rank/projectile colors).
+  - 172 deterministic Frontier spawns simulated server-side.
+  - Ranged & magic mobs kite to `preferredRangePx`, broadcast `monster_attack`
+    so clients render the matching themed projectile (fireball/arrow/orb).
+  - Stationary mobs (piranha) attack in place.
+  - Elite-tagged spawns auto-scaled (HP × 2.2, ATK × 1.5).
 - Phase 2 — Skill casts & projectiles: TODO.
 - Phase 3 — Loot drops on monster death: TODO.
 - Phase 4 — PvP arena combat: TODO.

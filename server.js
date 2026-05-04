@@ -22,7 +22,7 @@
 const express = require('express');
 const http = require('http');
 const { WebSocketServer } = require('ws');
-const { TILE_SIZE, MONSTER_DEFS, WILDWOOD_SPAWNS } = require('./monsterDefs');
+const { TILE_SIZE, MONSTER_DEFS, WILDWOOD_SPAWNS, FRONTIER_SPAWNS, getEffectiveDef } = require('./monsterDefs');
 
 const PORT = process.env.PORT || 8080;
 
@@ -55,7 +55,7 @@ app.get('/health', (_req, res) => {
     ok: true,
     region: 'europe',
     service: 'websocket',
-    phase: '1A',
+    phase: '1B',
     rooms: rooms.size,
     players: totalPlayers,
     monsters: totalMonsters,
@@ -129,35 +129,50 @@ function getRoom(roomKey) {
   return r;
 }
 
+function spawnEntry(uid, defId, tileX, tileY, rank) {
+  const baseDef = MONSTER_DEFS[defId];
+  if (!baseDef) return null;
+  const eff = getEffectiveDef(defId, rank || 'normal');
+  const x = tileX * TILE_SIZE + TILE_SIZE / 2;
+  const y = tileY * TILE_SIZE + TILE_SIZE / 2;
+  return {
+    uid,
+    defId,
+    rank: rank || (baseDef.rank ?? 'normal'),
+    x, y, spawnX: x, spawnY: y,
+    hp: eff.maxHp, maxHp: eff.maxHp,
+    state: 'idle', facing: 'left',
+    attackAnimEnd: 0, attackCdEnd: 0,
+    deathAt: 0, respawnAt: 0,
+    lastTargetX: x, lastTargetY: y,
+    nextWanderAt: Date.now() + 1000 + Math.random() * 2000,
+    wanderVx: 0, wanderVy: 0,
+    aggroId: null,
+  };
+}
+
 /** Initialize the monster set for a room if it's a known monster room and not yet inited. */
 function ensureMonsters(roomKey) {
   const r = getRoom(roomKey);
   if (r.monsters) return r;
-  // Phase 1A: only Wildwood. Other rooms get an empty monster set (no sim).
   if (roomKey === 'europe:wildwood') {
     r.monsters = new Map();
     WILDWOOD_SPAWNS.forEach((s, i) => {
-      const def = MONSTER_DEFS[s.defId];
-      if (!def) return;
-      const x = s.tileX * TILE_SIZE + TILE_SIZE / 2;
-      const y = s.tileY * TILE_SIZE + TILE_SIZE / 2;
-      r.monsters.set(`wildwood:${i}`, {
-        uid: `wildwood:${i}`,
-        defId: s.defId,
-        x, y, spawnX: x, spawnY: y,
-        hp: def.maxHp, maxHp: def.maxHp,
-        state: 'idle', facing: 'left',
-        attackAnimEnd: 0, attackCdEnd: 0,
-        deathAt: 0, respawnAt: 0,
-        lastTargetX: x, lastTargetY: y,
-        nextWanderAt: Date.now() + 1000 + Math.random() * 2000,
-        wanderVx: 0, wanderVy: 0,
-        aggroId: null,
-      });
+      const uid = `wildwood:${i}`;
+      const m = spawnEntry(uid, s.defId, s.tileX, s.tileY, s.elite ? 'elite' : null);
+      if (m) r.monsters.set(uid, m);
+    });
+    console.log(`[ws] initialized ${r.monsters.size} monsters for ${roomKey}`);
+  } else if (roomKey === 'europe:frontier') {
+    r.monsters = new Map();
+    FRONTIER_SPAWNS.forEach((s, i) => {
+      const uid = `frontier:${i}`;
+      const m = spawnEntry(uid, s.defId, s.tileX, s.tileY, s.elite ? 'elite' : null);
+      if (m) r.monsters.set(uid, m);
     });
     console.log(`[ws] initialized ${r.monsters.size} monsters for ${roomKey}`);
   } else {
-    r.monsters = new Map(); // no-op for now; Phase 1B adds frontier
+    r.monsters = new Map();
   }
   return r;
 }
@@ -222,8 +237,10 @@ function broadcastMonsterSnapshot(roomKey) {
 // ---------------------------------------------------------------------------
 // Monster AI (simple melee chase + wander)
 // ---------------------------------------------------------------------------
+function effDef(m) { return getEffectiveDef(m.defId, m.rank || 'normal'); }
+
 function nearestAlivePlayer(room, m) {
-  const def = MONSTER_DEFS[m.defId];
+  const def = effDef(m);
   const aggroPx = def.aggroTiles * TILE_SIZE;
   const losePx = aggroPx * AGGRO_LOSE_MULT;
   let best = null;
@@ -240,6 +257,11 @@ function nearestAlivePlayer(room, m) {
   return best;
 }
 
+function attackKindToWire(kind) {
+  if (kind === 'fireball' || kind === 'arrow' || kind === 'magic_orb') return kind;
+  return 'melee';
+}
+
 function tickRoom(roomKey, dtMs) {
   const r = rooms.get(roomKey);
   if (!r || !r.monsters || r.monsters.size === 0) return;
@@ -251,7 +273,7 @@ function tickRoom(roomKey, dtMs) {
     if (m.state === 'dead') {
       if (m.respawnAt > 0 && now >= m.respawnAt) {
         m.x = m.spawnX; m.y = m.spawnY;
-        const def = MONSTER_DEFS[m.defId];
+        const def = effDef(m);
         m.hp = def.maxHp; m.maxHp = def.maxHp;
         m.state = 'idle';
         m.deathAt = 0; m.respawnAt = 0;
@@ -262,7 +284,6 @@ function tickRoom(roomKey, dtMs) {
       continue;
     }
     if (m.state === 'dying') {
-      // Brief death animation window before going dead.
       if (now - m.deathAt > 500) {
         m.state = 'dead';
         m.respawnAt = now + RESPAWN_MS;
@@ -270,7 +291,10 @@ function tickRoom(roomKey, dtMs) {
       continue;
     }
 
-    const def = MONSTER_DEFS[m.defId];
+    const def = effDef(m);
+    const role = def.role || 'melee';
+    const isRanged = role === 'ranged' || role === 'magic' || def.attackKind === 'fireball' || def.attackKind === 'arrow' || def.attackKind === 'magic_orb';
+    const projectileKind = (def.attackKind === 'fireball' || def.attackKind === 'arrow' || def.attackKind === 'magic_orb') ? def.attackKind : null;
 
     // ---------- Aggro ----------
     let target = null;
@@ -284,44 +308,116 @@ function tickRoom(roomKey, dtMs) {
     }
 
     if (target && !def.stationary) {
-      // ---------- Chase ----------
       const dx = target.x - m.x;
       const dy = target.y - m.y;
-      const dist = Math.hypot(dx, dy);
+      const dist = Math.hypot(dx, dy) || 1;
       m.lastTargetX = target.x;
       m.lastTargetY = target.y;
       m.facing = Math.abs(dx) > Math.abs(dy) ? (dx < 0 ? 'left' : 'right') : (dy < 0 ? 'up' : 'down');
 
-      if (dist > def.attackRangePx) {
-        // Move toward target. Honor home tether so monsters don't run forever.
-        const fromHome = Math.hypot(m.x - m.spawnX, m.y - m.spawnY);
+      const fromHome = Math.hypot(m.x - m.spawnX, m.y - m.spawnY);
+      const speed = def.speed * (dtMs / 16.67);
+      const inAttackRange = dist <= def.attackRangePx;
+
+      // Ranged: kite to preferred distance.
+      if (isRanged && projectileKind) {
+        const pref = def.preferredRangePx || Math.max(80, def.attackRangePx * 0.8);
+        if (fromHome >= homeRange) {
+          // recover home
+          const hx = m.spawnX - m.x, hy = m.spawnY - m.y;
+          const hd = Math.hypot(hx, hy) || 1;
+          m.x += (hx / hd) * speed; m.y += (hy / hd) * speed;
+          m.aggroId = null; m.state = 'chase';
+        } else if (dist < pref * 0.7) {
+          // back away
+          m.x -= (dx / dist) * speed * 0.7;
+          m.y -= (dy / dist) * speed * 0.7;
+          m.state = 'chase';
+        } else if (dist > def.attackRangePx) {
+          m.x += (dx / dist) * speed; m.y += (dy / dist) * speed;
+          m.state = 'chase';
+        } else {
+          m.state = 'attack';
+        }
+        if (dist <= def.attackRangePx && now >= m.attackCdEnd) {
+          m.attackAnimEnd = now + ATTACK_ANIM_MS;
+          m.attackCdEnd = now + def.attackCdMs;
+          // Broadcast projectile spawn so clients render it.
+          broadcastToRoom(roomKey, {
+            type: 'monster_attack',
+            payload: {
+              playerId: 'server:europe',
+              room: roomKey,
+              monsterUid: m.uid,
+              kind: projectileKind,
+              tx: target.x,
+              ty: target.y,
+              ts: now,
+            },
+          });
+        } else if (now >= m.attackAnimEnd && m.state === 'attack' && dist > def.attackRangePx) {
+          m.state = 'idle';
+        }
+        continue;
+      }
+
+      // Melee chase
+      if (!inAttackRange) {
         if (fromHome < homeRange) {
-          const speed = def.speed * (dtMs / 16.67); // convert px/frame@60Hz to per-dt
           m.x += (dx / dist) * speed;
           m.y += (dy / dist) * speed;
         } else {
-          // Snap toward home to recover.
           const hx = m.spawnX - m.x, hy = m.spawnY - m.y;
           const hd = Math.hypot(hx, hy) || 1;
-          const speed = def.speed * (dtMs / 16.67);
           m.x += (hx / hd) * speed;
           m.y += (hy / hd) * speed;
           m.aggroId = null;
         }
         m.state = 'chase';
       } else {
-        // ---------- Attack ----------
         m.state = 'attack';
         if (now >= m.attackCdEnd) {
           m.attackAnimEnd = now + ATTACK_ANIM_MS;
           m.attackCdEnd = now + def.attackCdMs;
-          // Damage application against players is Phase 4 (PvP/combat sync).
-          // For Phase 1A the swing animation propagates via snapshot; clients
-          // still apply self-damage locally via the existing player-collision
-          // path (unchanged from Asia behavior).
+          // Notify clients of melee swing (animation only; client handles self-damage).
+          broadcastToRoom(roomKey, {
+            type: 'monster_attack',
+            payload: {
+              playerId: 'server:europe',
+              room: roomKey,
+              monsterUid: m.uid,
+              kind: 'melee',
+              tx: target.x,
+              ty: target.y,
+              ts: now,
+            },
+          });
         } else if (now >= m.attackAnimEnd) {
           m.state = 'idle';
         }
+      }
+      continue;
+    }
+
+    // Stationary attacker (e.g. piranha)
+    if (target && def.stationary) {
+      const dx = target.x - m.x, dy = target.y - m.y;
+      const dist = Math.hypot(dx, dy) || 1;
+      m.facing = Math.abs(dx) > Math.abs(dy) ? (dx < 0 ? 'left' : 'right') : (dy < 0 ? 'up' : 'down');
+      if (dist <= def.attackRangePx && now >= m.attackCdEnd) {
+        m.state = 'attack';
+        m.attackAnimEnd = now + ATTACK_ANIM_MS;
+        m.attackCdEnd = now + def.attackCdMs;
+        broadcastToRoom(roomKey, {
+          type: 'monster_attack',
+          payload: {
+            playerId: 'server:europe', room: roomKey, monsterUid: m.uid,
+            kind: projectileKind || 'melee',
+            tx: target.x, ty: target.y, ts: now,
+          },
+        });
+      } else if (now >= m.attackAnimEnd) {
+        m.state = 'idle';
       }
       continue;
     }
@@ -339,7 +435,6 @@ function tickRoom(roomKey, dtMs) {
       const speed = def.speed * 0.4 * (dtMs / 16.67);
       const nx = m.x + m.wanderVx * speed;
       const ny = m.y + m.wanderVy * speed;
-      // Keep near spawn.
       if (Math.hypot(nx - m.spawnX, ny - m.spawnY) < homeRange * 0.5) {
         m.x = nx; m.y = ny;
         m.facing = Math.abs(m.wanderVx) > Math.abs(m.wanderVy)
