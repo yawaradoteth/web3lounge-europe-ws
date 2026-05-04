@@ -1,23 +1,65 @@
 // Europe WebSocket server for web3lounge.
-// Deployed as a separate Render Web Service (NOT the frontend).
-// Public host (after deploy): web3lounge-europe-ws.onrender.com
+// Phase 1A: Server-authoritative monster state for the Wildwood room.
 //
 // Endpoints:
-//   GET  /health   -> { ok: true, region: "europe", service: "websocket" }
-//   WS   /         -> JSON protocol: ping/pong, join, move, chat
+//   GET  /health   -> { ok, region, service, rooms, monsters }
+//   WS   /         -> JSON protocol (see PROTOCOL.md)
 //
-// Listens on process.env.PORT (Render injects this).
+// Authority model:
+//   - This server is the SOLE source of truth for monster spawn / position /
+//     HP / death / respawn for any Europe room it simulates.
+//   - Clients never run monster AI for Europe rooms — they receive snapshots
+//     and render. Host election (room_hosts table) is bypassed for Europe.
+//   - Damage requests come in as `attack_intent` (existing client format) and
+//     are validated server-side before HP is applied. Each intent is dedup'd
+//     by `intentId` so retransmits don't double-hit.
+//
+// Phase 1A scope:
+//   - Wildwood only (17 fixed spawns, simple melee AI).
+//   - Frontier / PvP arena will be added in Phase 1B.
+//   - No loot / EXP / quest credit yet (those need service-role DB writes).
 
 const express = require('express');
 const http = require('http');
 const { WebSocketServer } = require('ws');
+const { TILE_SIZE, MONSTER_DEFS, WILDWOOD_SPAWNS } = require('./monsterDefs');
 
 const PORT = process.env.PORT || 8080;
 
+// ---------------------------------------------------------------------------
+// Tunables (mirror client constants where relevant)
+// ---------------------------------------------------------------------------
+const TICK_HZ = 20;                 // monster AI tick rate
+const SNAPSHOT_HZ = 12;             // broadcast cadence (~80ms, matches client)
+const RESPAWN_MS = 15_000;
+const ATTACK_ANIM_MS = 280;
+const AGGRO_LOSE_MULT = 1.5;        // give up chase outside aggro * this
+const HOME_TETHER_TILES = 6;        // monster won't wander further than this from spawn
+const INTENT_DEDUP_SIZE = 1024;
+const PLAYER_STALE_MS = 30_000;     // drop player if no message for 30s
+const MAX_DAMAGE_PER_INTENT = 9999; // hard cap to mitigate trivial cheating
+
+// ---------------------------------------------------------------------------
+// Express health endpoint
+// ---------------------------------------------------------------------------
 const app = express();
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, region: 'europe', service: 'websocket' });
+  let totalMonsters = 0;
+  let totalPlayers = 0;
+  for (const r of rooms.values()) {
+    totalPlayers += r.players.size;
+    totalMonsters += r.monsters ? r.monsters.size : 0;
+  }
+  res.json({
+    ok: true,
+    region: 'europe',
+    service: 'websocket',
+    phase: '1A',
+    rooms: rooms.size,
+    players: totalPlayers,
+    monsters: totalMonsters,
+  });
 });
 
 app.get('/', (_req, res) => {
@@ -27,18 +69,103 @@ app.get('/', (_req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-/** roomKey -> Map<characterId, playerState> */
+// ---------------------------------------------------------------------------
+// Room state
+// ---------------------------------------------------------------------------
+/**
+ * @typedef {Object} Player
+ * @property {string} characterId
+ * @property {string} userId          - WebSocket-bound id used as authoritative key
+ * @property {string} name
+ * @property {number} x
+ * @property {number} y
+ * @property {string} direction
+ * @property {string} mapId
+ * @property {string} [class]
+ * @property {number} [level]
+ */
+
+/**
+ * @typedef {Object} Monster
+ * @property {string} uid              - monster_key, deterministic ('wildwood:0'..)
+ * @property {string} defId
+ * @property {number} x
+ * @property {number} y
+ * @property {number} spawnX
+ * @property {number} spawnY
+ * @property {number} hp
+ * @property {number} maxHp
+ * @property {string} state            - 'idle'|'chase'|'attack'|'dying'|'dead'
+ * @property {string} facing           - 'left'|'right'|'up'|'down'
+ * @property {number} attackAnimEnd    - ms since epoch
+ * @property {number} attackCdEnd      - ms since epoch
+ * @property {number} deathAt          - ms since epoch (0 if alive)
+ * @property {number} respawnAt        - ms since epoch (0 if alive)
+ * @property {number} lastTargetX
+ * @property {number} lastTargetY
+ * @property {number} nextWanderAt
+ * @property {number} wanderVx
+ * @property {number} wanderVy
+ * @property {string|null} aggroId     - userId of current target
+ */
+
+/** roomKey -> { players: Map<userId,Player>, monsters: Map<uid,Monster>, intentSeen: Set<string>, intentOrder: string[] } */
 const rooms = new Map();
-/** ws -> { roomKey, characterId } */
+/** ws -> { roomKey, userId, characterId } */
 const sockets = new Map();
 
 function getRoom(roomKey) {
   let r = rooms.get(roomKey);
-  if (!r) { r = new Map(); rooms.set(roomKey, r); }
+  if (!r) {
+    r = {
+      players: new Map(),
+      monsters: null,
+      intentSeen: new Set(),
+      intentOrder: [],
+      lastSnapshotAt: 0,
+    };
+    rooms.set(roomKey, r);
+  }
   return r;
 }
 
-function broadcastToRoom(roomKey, payload, exceptWs) {
+/** Initialize the monster set for a room if it's a known monster room and not yet inited. */
+function ensureMonsters(roomKey) {
+  const r = getRoom(roomKey);
+  if (r.monsters) return r;
+  // Phase 1A: only Wildwood. Other rooms get an empty monster set (no sim).
+  if (roomKey === 'europe:wildwood') {
+    r.monsters = new Map();
+    WILDWOOD_SPAWNS.forEach((s, i) => {
+      const def = MONSTER_DEFS[s.defId];
+      if (!def) return;
+      const x = s.tileX * TILE_SIZE + TILE_SIZE / 2;
+      const y = s.tileY * TILE_SIZE + TILE_SIZE / 2;
+      r.monsters.set(`wildwood:${i}`, {
+        uid: `wildwood:${i}`,
+        defId: s.defId,
+        x, y, spawnX: x, spawnY: y,
+        hp: def.maxHp, maxHp: def.maxHp,
+        state: 'idle', facing: 'left',
+        attackAnimEnd: 0, attackCdEnd: 0,
+        deathAt: 0, respawnAt: 0,
+        lastTargetX: x, lastTargetY: y,
+        nextWanderAt: Date.now() + 1000 + Math.random() * 2000,
+        wanderVx: 0, wanderVy: 0,
+        aggroId: null,
+      });
+    });
+    console.log(`[ws] initialized ${r.monsters.size} monsters for ${roomKey}`);
+  } else {
+    r.monsters = new Map(); // no-op for now; Phase 1B adds frontier
+  }
+  return r;
+}
+
+// ---------------------------------------------------------------------------
+// Broadcast helpers
+// ---------------------------------------------------------------------------
+function broadcastToRoom(roomKey, payload, exceptWs = null) {
   const data = JSON.stringify(payload);
   for (const client of wss.clients) {
     if (client.readyState !== 1) continue;
@@ -49,13 +176,288 @@ function broadcastToRoom(roomKey, payload, exceptWs) {
   }
 }
 
+function sendTo(ws, payload) {
+  if (ws.readyState === 1) ws.send(JSON.stringify(payload));
+}
+
+function buildMonsterRow(m) {
+  return {
+    room_key: '',  // filled by broadcaster
+    monster_key: m.uid,
+    def_id: m.defId,
+    x: m.x, y: m.y,
+    spawn_x: m.spawnX, spawn_y: m.spawnY,
+    hp: m.hp,
+    state: m.state,
+    facing: m.facing,
+    attack_anim_end: m.attackAnimEnd,
+    attack_cd_end: m.attackCdEnd,
+    death_at: m.deathAt,
+    respawn_at: m.respawnAt,
+    last_target_x: m.lastTargetX,
+    last_target_y: m.lastTargetY,
+  };
+}
+
+function broadcastMonsterSnapshot(roomKey) {
+  const r = rooms.get(roomKey);
+  if (!r || !r.monsters || r.monsters.size === 0) return;
+  if (r.players.size === 0) return; // nobody to receive
+  const rows = [];
+  for (const m of r.monsters.values()) {
+    const row = buildMonsterRow(m);
+    row.room_key = roomKey;
+    rows.push(row);
+  }
+  // Wire format mirrors client's MonsterSnapshotEvent.
+  const evt = {
+    room: roomKey,
+    hostId: 'server:europe',
+    monsters: rows,
+    ts: Date.now(),
+  };
+  broadcastToRoom(roomKey, { type: 'monster_snapshot', payload: evt });
+}
+
+// ---------------------------------------------------------------------------
+// Monster AI (simple melee chase + wander)
+// ---------------------------------------------------------------------------
+function nearestAlivePlayer(room, m) {
+  const def = MONSTER_DEFS[m.defId];
+  const aggroPx = def.aggroTiles * TILE_SIZE;
+  const losePx = aggroPx * AGGRO_LOSE_MULT;
+  let best = null;
+  let bestDist = Infinity;
+  for (const p of room.players.values()) {
+    const dx = p.x - m.x;
+    const dy = p.y - m.y;
+    const d2 = dx * dx + dy * dy;
+    if (d2 < bestDist) { best = p; bestDist = d2; }
+  }
+  if (!best) return null;
+  const limit = m.aggroId ? losePx : aggroPx;
+  if (bestDist > limit * limit) return null;
+  return best;
+}
+
+function tickRoom(roomKey, dtMs) {
+  const r = rooms.get(roomKey);
+  if (!r || !r.monsters || r.monsters.size === 0) return;
+  const now = Date.now();
+  const homeRange = HOME_TETHER_TILES * TILE_SIZE;
+
+  for (const m of r.monsters.values()) {
+    // ---------- Death / respawn ----------
+    if (m.state === 'dead') {
+      if (m.respawnAt > 0 && now >= m.respawnAt) {
+        m.x = m.spawnX; m.y = m.spawnY;
+        const def = MONSTER_DEFS[m.defId];
+        m.hp = def.maxHp; m.maxHp = def.maxHp;
+        m.state = 'idle';
+        m.deathAt = 0; m.respawnAt = 0;
+        m.attackAnimEnd = 0; m.attackCdEnd = 0;
+        m.aggroId = null;
+        m.nextWanderAt = now + 1000 + Math.random() * 2000;
+      }
+      continue;
+    }
+    if (m.state === 'dying') {
+      // Brief death animation window before going dead.
+      if (now - m.deathAt > 500) {
+        m.state = 'dead';
+        m.respawnAt = now + RESPAWN_MS;
+      }
+      continue;
+    }
+
+    const def = MONSTER_DEFS[m.defId];
+
+    // ---------- Aggro ----------
+    let target = null;
+    if (m.aggroId) {
+      target = r.players.get(m.aggroId) || null;
+      if (!target) m.aggroId = null;
+    }
+    if (!target) {
+      target = nearestAlivePlayer(r, m);
+      if (target) m.aggroId = target.userId;
+    }
+
+    if (target && !def.stationary) {
+      // ---------- Chase ----------
+      const dx = target.x - m.x;
+      const dy = target.y - m.y;
+      const dist = Math.hypot(dx, dy);
+      m.lastTargetX = target.x;
+      m.lastTargetY = target.y;
+      m.facing = Math.abs(dx) > Math.abs(dy) ? (dx < 0 ? 'left' : 'right') : (dy < 0 ? 'up' : 'down');
+
+      if (dist > def.attackRangePx) {
+        // Move toward target. Honor home tether so monsters don't run forever.
+        const fromHome = Math.hypot(m.x - m.spawnX, m.y - m.spawnY);
+        if (fromHome < homeRange) {
+          const speed = def.speed * (dtMs / 16.67); // convert px/frame@60Hz to per-dt
+          m.x += (dx / dist) * speed;
+          m.y += (dy / dist) * speed;
+        } else {
+          // Snap toward home to recover.
+          const hx = m.spawnX - m.x, hy = m.spawnY - m.y;
+          const hd = Math.hypot(hx, hy) || 1;
+          const speed = def.speed * (dtMs / 16.67);
+          m.x += (hx / hd) * speed;
+          m.y += (hy / hd) * speed;
+          m.aggroId = null;
+        }
+        m.state = 'chase';
+      } else {
+        // ---------- Attack ----------
+        m.state = 'attack';
+        if (now >= m.attackCdEnd) {
+          m.attackAnimEnd = now + ATTACK_ANIM_MS;
+          m.attackCdEnd = now + def.attackCdMs;
+          // Damage application against players is Phase 4 (PvP/combat sync).
+          // For Phase 1A the swing animation propagates via snapshot; clients
+          // still apply self-damage locally via the existing player-collision
+          // path (unchanged from Asia behavior).
+        } else if (now >= m.attackAnimEnd) {
+          m.state = 'idle';
+        }
+      }
+      continue;
+    }
+
+    // ---------- Wander / idle ----------
+    if (def.stationary) { m.state = 'idle'; continue; }
+    if (now >= m.nextWanderAt) {
+      m.nextWanderAt = now + 2000 + Math.random() * 3000;
+      const angle = Math.random() * Math.PI * 2;
+      const mag = 0.3 + Math.random() * 0.5;
+      m.wanderVx = Math.cos(angle) * mag;
+      m.wanderVy = Math.sin(angle) * mag;
+    }
+    if (m.wanderVx !== 0 || m.wanderVy !== 0) {
+      const speed = def.speed * 0.4 * (dtMs / 16.67);
+      const nx = m.x + m.wanderVx * speed;
+      const ny = m.y + m.wanderVy * speed;
+      // Keep near spawn.
+      if (Math.hypot(nx - m.spawnX, ny - m.spawnY) < homeRange * 0.5) {
+        m.x = nx; m.y = ny;
+        m.facing = Math.abs(m.wanderVx) > Math.abs(m.wanderVy)
+          ? (m.wanderVx < 0 ? 'left' : 'right')
+          : (m.wanderVy < 0 ? 'up' : 'down');
+      } else {
+        m.wanderVx = -m.wanderVx; m.wanderVy = -m.wanderVy;
+      }
+    }
+    m.state = 'idle';
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Damage handling (with dedup)
+// ---------------------------------------------------------------------------
+function rememberIntent(room, intentId) {
+  if (!intentId) return false; // un-id'd intents always processed (best-effort)
+  if (room.intentSeen.has(intentId)) return true;
+  room.intentSeen.add(intentId);
+  room.intentOrder.push(intentId);
+  if (room.intentOrder.length > INTENT_DEDUP_SIZE) {
+    const old = room.intentOrder.shift();
+    room.intentSeen.delete(old);
+  }
+  return false;
+}
+
+/**
+ * Resolve an attack_intent against monsters in the room.
+ * Validates: monster alive, attacker present, hit area inside aggro+attack
+ * envelope, dedup by intentId.
+ *
+ * Damage formula (Phase 1A): if attacker provides `attackerScaling` we use
+ * `floor(scaling * (0.85..1.15)) * (crit?1.5:1)`. Otherwise fall back to a
+ * conservative def.attack-based number. Capped at MAX_DAMAGE_PER_INTENT.
+ */
+function resolveAttackIntent(roomKey, evt, attackerWs) {
+  const r = ensureMonsters(roomKey);
+  if (!r.monsters || r.monsters.size === 0) return;
+  if (rememberIntent(r, evt.intentId)) return;
+
+  const attackerId = evt.playerId;
+  const attacker = r.players.get(attackerId);
+  if (!attacker) return; // ghost intent — ignore.
+
+  const ax = Number(evt.x), ay = Number(evt.y);
+  const ar = Math.max(8, Number(evt.r) || 24);
+  if (!isFinite(ax) || !isFinite(ay)) return;
+  // Guard against absurd radius — cap at 1.5 tiles.
+  const r2 = Math.min(ar, TILE_SIZE * 6);
+
+  const scaling = Number(evt.attackerScaling);
+  const critChance = Math.max(0, Math.min(1, Number(evt.attackerCrit) || 0));
+
+  for (const m of r.monsters.values()) {
+    if (m.state === 'dead' || m.state === 'dying') continue;
+    if (m.hp <= 0) continue;
+    const dx = m.x - ax, dy = m.y - ay;
+    if (dx * dx + dy * dy > r2 * r2) continue;
+
+    // Sanity range gate: attacker must be near the area they're claiming to hit.
+    const adx = attacker.x - ax, ady = attacker.y - ay;
+    if (adx * adx + ady * ady > (TILE_SIZE * 8) * (TILE_SIZE * 8)) continue;
+
+    // Compute damage.
+    let dmg;
+    if (isFinite(scaling) && scaling > 0) {
+      const variance = 0.85 + Math.random() * 0.3;
+      dmg = Math.max(1, Math.floor(scaling * variance));
+    } else {
+      const def = MONSTER_DEFS[m.defId];
+      dmg = Math.max(1, Math.floor((def?.attack ?? 5) * 1.5));
+    }
+    const crit = Math.random() < critChance;
+    if (crit) dmg = Math.floor(dmg * 1.5);
+    dmg = Math.min(MAX_DAMAGE_PER_INTENT, dmg);
+
+    m.hp -= dmg;
+    m.aggroId = attackerId; // monster now targets the attacker
+    m.lastTargetX = attacker.x;
+    m.lastTargetY = attacker.y;
+
+    let died = false;
+    if (m.hp <= 0) {
+      m.hp = 0;
+      m.state = 'dying';
+      m.deathAt = Date.now();
+      m.aggroId = null;
+      died = true;
+    }
+
+    // Echo a monster_hit event so attacker sees floating damage immediately.
+    const hitEvt = {
+      playerId: 'server:europe',
+      room: roomKey,
+      monsterUid: m.uid,
+      dmg,
+      crit,
+      x: m.x, y: m.y,
+      attackerId,
+      hpAfter: m.hp,
+      died,
+      ts: Date.now(),
+    };
+    broadcastToRoom(roomKey, { type: 'monster_hit', payload: hitEvt });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Connection lifecycle
+// ---------------------------------------------------------------------------
 function leaveCurrentRoom(ws) {
   const meta = sockets.get(ws);
   if (!meta) return;
-  const room = rooms.get(meta.roomKey);
-  if (room) {
-    room.delete(meta.characterId);
-    if (room.size === 0) rooms.delete(meta.roomKey);
+  const r = rooms.get(meta.roomKey);
+  if (r) {
+    r.players.delete(meta.userId);
   }
   broadcastToRoom(meta.roomKey, { type: 'player_left', payload: { playerId: meta.characterId } }, ws);
   sockets.delete(ws);
@@ -71,33 +473,51 @@ wss.on('connection', (ws) => {
 
     switch (msg.type) {
       case 'ping': {
-        ws.send(JSON.stringify({ type: 'pong', clientTime: msg.clientTime, serverTime: Date.now() }));
+        sendTo(ws, { type: 'pong', clientTime: msg.clientTime, serverTime: Date.now() });
         return;
       }
+
       case 'join': {
         const mapId = msg.mapId || 'town';
         const characterId = msg.characterId || msg.playerId;
         if (!characterId) return;
         leaveCurrentRoom(ws);
         const roomKey = `europe:${mapId}`;
+        const room = ensureMonsters(roomKey);
         const player = {
-          playerId: characterId,
           characterId,
+          userId: characterId,
           name: msg.name,
-          x: msg.x ?? 0,
-          y: msg.y ?? 0,
-          direction: msg.direction ?? 'down',
+          x: Number(msg.x) || 0,
+          y: Number(msg.y) || 0,
+          direction: msg.direction || 'down',
           mapId,
           class: msg.class,
           level: msg.level,
         };
-        getRoom(roomKey).set(characterId, player);
-        sockets.set(ws, { roomKey, characterId });
-        const existing = Array.from(getRoom(roomKey).values()).filter(p => p.characterId !== characterId);
-        ws.send(JSON.stringify({ type: 'existing_players', players: existing }));
+        room.players.set(characterId, player);
+        sockets.set(ws, { roomKey, userId: characterId, characterId });
+
+        const existing = Array.from(room.players.values()).filter(p => p.characterId !== characterId);
+        sendTo(ws, { type: 'existing_players', players: existing });
         broadcastToRoom(roomKey, { type: 'player_joined', player }, ws);
+
+        // Send an immediate monster snapshot so the joiner sees current state.
+        if (room.monsters && room.monsters.size > 0) {
+          const rows = [];
+          for (const m of room.monsters.values()) {
+            const row = buildMonsterRow(m);
+            row.room_key = roomKey;
+            rows.push(row);
+          }
+          sendTo(ws, {
+            type: 'monster_snapshot',
+            payload: { room: roomKey, hostId: 'server:europe', monsters: rows, ts: Date.now() },
+          });
+        }
         return;
       }
+
       case 'move': {
         const meta = sockets.get(ws);
         if (!meta) return;
@@ -107,30 +527,69 @@ wss.on('connection', (ws) => {
         if (newRoomKey !== meta.roomKey) {
           // Map change — leave old, join new.
           leaveCurrentRoom(ws);
-          const player = { playerId: characterId, characterId, x: msg.x, y: msg.y, direction: msg.direction, mapId: newMapId };
-          getRoom(newRoomKey).set(characterId, player);
-          sockets.set(ws, { roomKey: newRoomKey, characterId });
-          const existing = Array.from(getRoom(newRoomKey).values()).filter(p => p.characterId !== characterId);
-          ws.send(JSON.stringify({ type: 'existing_players', players: existing }));
+          const room = ensureMonsters(newRoomKey);
+          const player = {
+            characterId, userId: characterId,
+            x: Number(msg.x) || 0, y: Number(msg.y) || 0,
+            direction: msg.direction || 'down',
+            mapId: newMapId,
+          };
+          room.players.set(characterId, player);
+          sockets.set(ws, { roomKey: newRoomKey, userId: characterId, characterId });
+          const existing = Array.from(room.players.values()).filter(p => p.characterId !== characterId);
+          sendTo(ws, { type: 'existing_players', players: existing });
           broadcastToRoom(newRoomKey, { type: 'player_joined', player }, ws);
+          if (room.monsters && room.monsters.size > 0) {
+            const rows = [];
+            for (const m of room.monsters.values()) {
+              const row = buildMonsterRow(m);
+              row.room_key = newRoomKey;
+              rows.push(row);
+            }
+            sendTo(ws, {
+              type: 'monster_snapshot',
+              payload: { room: newRoomKey, hostId: 'server:europe', monsters: rows, ts: Date.now() },
+            });
+          }
           return;
         }
-        const room = getRoom(meta.roomKey);
-        const p = room.get(characterId);
-        if (p) { p.x = msg.x; p.y = msg.y; p.direction = msg.direction; }
+        const room = rooms.get(meta.roomKey);
+        if (!room) return;
+        const p = room.players.get(characterId);
+        if (p) {
+          p.x = Number(msg.x) || 0;
+          p.y = Number(msg.y) || 0;
+          p.direction = msg.direction || p.direction;
+        }
         broadcastToRoom(meta.roomKey, {
           type: 'player_moved',
           payload: { playerId: characterId, x: msg.x, y: msg.y, dir: msg.direction, room: newMapId === 'town' ? 'world' : newMapId },
         }, ws);
         return;
       }
+
+      case 'attack_intent': {
+        const meta = sockets.get(ws);
+        if (!meta) return;
+        // Trust the message's room for this event since the client sends a
+        // namespaced room (e.g. 'europe:wildwood'); fall back to socket room.
+        const targetRoom = (msg.payload && msg.payload.room) || meta.roomKey;
+        if (typeof targetRoom !== 'string' || !targetRoom.startsWith('europe:')) return;
+        if (msg.payload) resolveAttackIntent(targetRoom, msg.payload, ws);
+        return;
+      }
+
       case 'chat': {
         const meta = sockets.get(ws);
         if (!meta) return;
         broadcastToRoom(meta.roomKey, { type: 'chat', payload: msg.payload ?? msg }, null);
         return;
       }
+
       default: {
+        // Generic broadcast pass-through (vitals, gather, action, etc.) so
+        // existing client features keep working while we expand authoritative
+        // coverage in later phases.
         const meta = sockets.get(ws);
         if (!meta) return;
         broadcastToRoom(meta.roomKey, { type: msg.type, payload: msg.payload ?? msg }, ws);
@@ -145,6 +604,33 @@ wss.on('connection', (ws) => {
 
   ws.on('error', (err) => console.warn('[ws] socket error', err.message));
 });
+
+// ---------------------------------------------------------------------------
+// Tick loops
+// ---------------------------------------------------------------------------
+const TICK_MS = Math.floor(1000 / TICK_HZ);
+const SNAPSHOT_MS = Math.floor(1000 / SNAPSHOT_HZ);
+
+let lastTickAt = Date.now();
+setInterval(() => {
+  const now = Date.now();
+  const dt = now - lastTickAt;
+  lastTickAt = now;
+  for (const roomKey of rooms.keys()) {
+    tickRoom(roomKey, dt);
+  }
+}, TICK_MS);
+
+setInterval(() => {
+  for (const roomKey of rooms.keys()) {
+    broadcastMonsterSnapshot(roomKey);
+  }
+}, SNAPSHOT_MS);
+
+// Cull stale players defensively (in case a close handler missed).
+setInterval(() => {
+  // Currently no per-player heartbeat; skip until we wire it.
+}, 60_000);
 
 server.listen(PORT, () => {
   console.log(`[europe-ws] listening on :${PORT}`);
