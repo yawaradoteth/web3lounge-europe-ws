@@ -23,6 +23,7 @@ const express = require('express');
 const http = require('http');
 const { WebSocketServer } = require('ws');
 const { TILE_SIZE, MONSTER_DEFS, WILDWOOD_SPAWNS, FRONTIER_SPAWNS, getEffectiveDef } = require('./monsterDefs');
+const { getCooldownMs, graceFor } = require('./skillDefs');
 
 const PORT = process.env.PORT || 8080;
 
@@ -55,7 +56,7 @@ app.get('/health', (_req, res) => {
     ok: true,
     region: 'europe',
     service: 'websocket',
-    phase: '1B',
+    phase: '2',
     rooms: rooms.size,
     players: totalPlayers,
     monsters: totalMonsters,
@@ -589,6 +590,9 @@ wss.on('connection', (ws) => {
           mapId,
           class: msg.class,
           level: msg.level,
+          castCdEnds: {},      // skillId -> ms-since-epoch when cast becomes legal
+          castSeen: new Set(), // dedupe set for castIds (size-bounded)
+          castOrder: [],
         };
         room.players.set(characterId, player);
         sockets.set(ws, { roomKey, userId: characterId, characterId });
@@ -628,6 +632,7 @@ wss.on('connection', (ws) => {
             x: Number(msg.x) || 0, y: Number(msg.y) || 0,
             direction: msg.direction || 'down',
             mapId: newMapId,
+            castCdEnds: {}, castSeen: new Set(), castOrder: [],
           };
           room.players.set(characterId, player);
           sockets.set(ws, { roomKey: newRoomKey, userId: characterId, characterId });
@@ -678,6 +683,53 @@ wss.on('connection', (ws) => {
         const meta = sockets.get(ws);
         if (!meta) return;
         broadcastToRoom(meta.roomKey, { type: 'chat', payload: msg.payload ?? msg }, null);
+        return;
+      }
+
+      case 'action': {
+        // Phase 2: server-validated skill / basic-attack cast broadcast.
+        // We re-stamp playerId from the socket, gate by per-player cooldown,
+        // and dedupe by castId so a retransmit can't fire the visual twice.
+        const meta = sockets.get(ws);
+        if (!meta) return;
+        const room = rooms.get(meta.roomKey);
+        if (!room) return;
+        const player = room.players.get(meta.userId);
+        if (!player) return;
+        const p = msg.payload || {};
+        const skillId = typeof p.skillId === 'string' ? p.skillId : null;
+        const kind = p.kind === 'skill' ? 'skill' : 'basic';
+        if (!skillId) return;
+
+        const now = Date.now();
+        const cd = getCooldownMs(skillId, kind);
+        const grace = graceFor(cd);
+        const cdEnd = player.castCdEnds[skillId] || 0;
+        if (now + grace < cdEnd) {
+          // Cast came in too early — silently drop. Avoids letting a hacked
+          // client spam a 22s buff or 1.5s nuke. We don't tell the offender
+          // explicitly to keep the protocol simple.
+          return;
+        }
+        // Dedupe by castId (when present). Bound the set so memory stays flat.
+        const castId = typeof p.castId === 'string' ? p.castId
+                       : `${meta.userId}:${skillId}:${p.ts || now}`;
+        if (player.castSeen.has(castId)) return;
+        player.castSeen.add(castId);
+        player.castOrder.push(castId);
+        if (player.castOrder.length > 64) {
+          const drop = player.castOrder.shift();
+          if (drop) player.castSeen.delete(drop);
+        }
+
+        // Lock cooldown using the SERVER's clock so client clock skew can't
+        // shift the next-allowed-cast forward.
+        player.castCdEnds[skillId] = now + cd;
+
+        // Re-stamp playerId from the authenticated socket so a client can't
+        // forge casts from another player.
+        const safePayload = { ...p, playerId: meta.userId, room: meta.roomKey, ts: now };
+        broadcastToRoom(meta.roomKey, { type: 'action', payload: safePayload }, ws);
         return;
       }
 

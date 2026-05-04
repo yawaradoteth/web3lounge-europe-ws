@@ -12,8 +12,20 @@ Authoritative live-gameplay backend for the Europe region of web3lounge.
     so clients render the matching themed projectile (fireball/arrow/orb).
   - Stationary mobs (piranha) attack in place.
   - Elite-tagged spawns auto-scaled (HP × 2.2, ATK × 1.5).
-- Phase 2 — Skill casts & projectiles: TODO.
-- Phase 3 — Loot drops on monster death: TODO.
+- **Phase 2 — Server-validated skill casts** ✅
+  - All `action` events (basic + skill) flow through the server, which
+    enforces per-player + per-skill cooldown using `skillDefs.js`, dedupes
+    by `castId`, and re-stamps `playerId`/`room`/`ts` before fanning out.
+  - Honest clients see no behavior change. Hacked clients can no longer
+    spam casts faster than the design cooldown (small grace window only).
+- **Phase 3 — Loot drops on monster death** ✅
+  - When the server confirms a monster died, the credited killer's client
+    rolls loot via the existing client-side tables (gold, consumables,
+    equipment, elite/mini-boss guarantees) and broadcasts `loot_drop`.
+  - The WS server dedupes drops by `loot.id` (capped at 512) and re-stamps
+    `playerId`/`room`/`ts` so a hacked client can't replay drop lists.
+  - Item rolls move fully server-side in Phase 5/6 once `items.ts` /
+    `monsters.ts` are ported (or the service-role key is wired in).
 - Phase 4 — PvP arena combat: TODO.
 - Phase 5 — Quest progress writes (needs `SUPABASE_SERVICE_ROLE_KEY`): TODO.
 - Phase 6 — Inventory/EXP/gold writes (needs service-role key): TODO.
@@ -40,7 +52,7 @@ overwrite the frontend service.
    - **Start Command**: `npm start`
 4. Verify after deploy:
    - `https://web3lounge-europe-ws.onrender.com/health` returns
-     `{ ok: true, region: "europe", service: "websocket", phase: "1A", ... }`.
+     `{ ok: true, region: "europe", service: "websocket", phase: "3", ... }`.
    - In-game: open Wildwood as two Europe characters, both should see the
      same monsters in the same positions, take damage in sync, and see
      deaths/respawns in sync.
